@@ -9334,3 +9334,68 @@ func TestSanitizeFTS(t *testing.T) {
 		})
 	}
 }
+
+// TestSearchPromptsShortTokensUseLikeFallback verifies that SearchPrompts
+// routes short-token queries (every term < 3 Unicode code points) to the
+// LIKE fallback path with wildcard escaping. This closes the prompt-fallback
+// test gap noted in upstream PR #537 review.
+func TestSearchPromptsShortTokensUseLikeFallback(t *testing.T) {
+	s := newTestStore(t)
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.CreateSession("sp-short", "engram", "/tmp/engram"); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sp-short",
+		Content:   "how to deploy v2 to prod",
+		Project:   "engram",
+	}); err != nil {
+		t.Fatalf("add prompt: %v", err)
+	}
+	if _, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sp-short",
+		Content:   "unrelated prompt about 東京都",
+		Project:   "engram",
+	}); err != nil {
+		t.Fatalf("add unrelated prompt: %v", err)
+	}
+
+	// 短词命中：全部词 < 3 runes → LIKE fallback
+	results, err := s.SearchPrompts("v2 prod", "", 10)
+	if err != nil {
+		t.Fatalf("search prompts short tokens: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 prompt hit for short-token query, got %d", len(results))
+	}
+
+	// 字面 % 和 _ 必须被转义：只有含字面字符的 prompt 命中
+	literalID, err := s.AddPrompt(AddPromptParams{
+		SessionID: "sp-short",
+		Content:   "progress 100% done with underscore _ check",
+		Project:   "engram",
+	})
+	if err != nil {
+		t.Fatalf("add literal prompt: %v", err)
+	}
+	pctResults, err := s.SearchPrompts("%", "", 10)
+	if err != nil {
+		t.Fatalf("search literal percent: %v", err)
+	}
+	if len(pctResults) != 1 || pctResults[0].ID != literalID {
+		t.Fatalf("expected literal percent hit only, got %+v", pctResults)
+	}
+	underscoreResults, err := s.SearchPrompts("_", "", 10)
+	if err != nil {
+		t.Fatalf("search literal underscore: %v", err)
+	}
+	if len(underscoreResults) != 1 || underscoreResults[0].ID != literalID {
+		t.Fatalf("expected literal underscore hit only, got %+v", underscoreResults)
+	}
+
+	// 空查询保持与 main 分支一致的报错行为
+	if _, err := s.SearchPrompts("", "", 10); err == nil {
+		t.Fatalf("expected error for empty prompt query")
+	}
+}
