@@ -2769,21 +2769,37 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 		limit = 10
 	}
 
+	longTerms, shortTerms := classifyQueryTerms(query)
+	allShort := len(longTerms) == 0 && len(shortTerms) > 0
+
 	sql := `
 		SELECT p.id, ifnull(p.sync_id, '') as sync_id, p.session_id, p.content, ifnull(p.project, '') as project, p.created_at
 	`
 	var args []any
-	if shouldUseTrigramLikeFallback(query) {
+	if allShort {
 		sql += `FROM user_prompts p WHERE `
 		appendLikeSearchCondition(&sql, &args, "ifnull(p.content, '') || ' ' || ifnull(p.project, '')", query, "all")
 	} else {
-		ftsQuery := sanitizeFTS(query)
-		sql += `
-			FROM prompts_fts fts
-			JOIN user_prompts p ON p.id = fts.rowid
-			WHERE prompts_fts MATCH ?
-		`
-		args = append(args, ftsQuery)
+		var ftsQuery string
+		if len(shortTerms) > 0 {
+			// Mixed query: index the long terms, enforce short terms via LIKE.
+			ftsQuery = buildFTSQuery(longTerms, "all")
+			sql += `
+				FROM prompts_fts fts
+				JOIN user_prompts p ON p.id = fts.rowid
+				WHERE prompts_fts MATCH ?
+			`
+			args = append(args, ftsQuery)
+			appendLikePredicate(&sql, &args, "ifnull(p.content, '') || ' ' || ifnull(p.project, '')", shortTerms, "all")
+		} else {
+			ftsQuery = sanitizeFTS(query)
+			sql += `
+				FROM prompts_fts fts
+				JOIN user_prompts p ON p.id = fts.rowid
+				WHERE prompts_fts MATCH ?
+			`
+			args = append(args, ftsQuery)
+		}
 	}
 
 	if project != "" {
@@ -2791,7 +2807,7 @@ func (s *Store) SearchPrompts(query string, project string, limit int) ([]Prompt
 		args = append(args, project)
 	}
 
-	if shouldUseTrigramLikeFallback(query) {
+	if allShort {
 		sql += " ORDER BY p.created_at DESC LIMIT ?"
 	} else {
 		sql += " ORDER BY fts.rank LIMIT ?"
@@ -3254,22 +3270,32 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		}
 	}
 
-	likeFallback := shouldUseTrigramLikeFallback(query)
+	longTerms, shortTerms := classifyQueryTerms(query)
+
+	// All-short queries use the bounded LIKE fallback (every term < 3 code
+	// points cannot be indexed by trigram FTS). Any query with at least one
+	// long term uses the FTS path; short terms in mixed queries are enforced
+	// as LIKE predicates on the FTS results so no term is silently dropped.
+	allShort := len(longTerms) == 0 && len(shortTerms) > 0
 	sqlQ := `
 		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
 		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
 	`
 	var args []any
-	if likeFallback {
+	if allShort {
 		sqlQ += `
 		       0.0 as rank
 		FROM observations o
 		WHERE o.deleted_at IS NULL AND `
 		appendLikeSearchCondition(&sqlQ, &args, "ifnull(o.title, '') || ' ' || ifnull(o.content, '') || ' ' || ifnull(o.tool_name, '') || ' ' || ifnull(o.type, '') || ' ' || ifnull(o.project, '') || ' ' || ifnull(o.topic_key, '')", query, opts.MatchMode)
 	} else {
-		// Build FTS5 query: "all" (default) uses AND semantics; "any" uses OR for broader recall.
+		// FTS path. In mixed queries only the long terms go into MATCH; short
+		// terms are added as LIKE predicates below so they still constrain the
+		// result (trigram FTS treats < 3-code-point terms as unconstrained).
 		var ftsQuery string
-		if opts.MatchMode == "any" {
+		if len(shortTerms) > 0 {
+			ftsQuery = buildFTSQuery(longTerms, opts.MatchMode)
+		} else if opts.MatchMode == "any" {
 			ftsQuery = sanitizeFTSCandidates(query)
 		} else {
 			ftsQuery = sanitizeFTS(query)
@@ -3281,6 +3307,9 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
 	`
 		args = append(args, ftsQuery)
+		if len(shortTerms) > 0 && opts.MatchMode != "any" {
+			appendLikePredicate(&sqlQ, &args, "o.title || ' ' || ifnull(o.content, '') || ' ' || ifnull(o.tool_name, '') || ' ' || ifnull(o.type, '') || ' ' || ifnull(o.project, '') || ' ' || ifnull(o.topic_key, '')", shortTerms, opts.MatchMode)
+		}
 	}
 
 	if opts.Type != "" {
@@ -3298,7 +3327,7 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		args = append(args, normalizeScope(opts.Scope))
 	}
 
-	if likeFallback {
+	if allShort {
 		sqlQ += " ORDER BY o.updated_at DESC LIMIT ?"
 	} else {
 		sqlQ += " ORDER BY rank LIMIT ?"
@@ -3330,10 +3359,76 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		}
 		if !seen[sr.ID] {
 			results = append(results, sr)
+			seen[sr.ID] = true
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	// any 混合模式：短词命中的行尚未被 FTS 结果覆盖时补充并入。
+	// FTS 路径只匹配长词；短词单独 LIKE 保证 any 语义的完整召回。
+	if !allShort && len(shortTerms) > 0 && opts.MatchMode == "any" {
+		shortSQL := `
+			SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+			       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+			       0.0 as rank
+			FROM observations o
+			WHERE o.deleted_at IS NULL AND (
+		`
+		var shortArgs []any
+		searchExpr := "ifnull(o.title, '') || ' ' || ifnull(o.content, '') || ' ' || ifnull(o.tool_name, '') || ' ' || ifnull(o.type, '') || ' ' || ifnull(o.project, '') || ' ' || ifnull(o.topic_key, '')"
+		for i, term := range shortTerms {
+			if i > 0 {
+				shortSQL += " OR "
+			}
+			shortSQL += searchExpr + ` LIKE ? ESCAPE '\'`
+			shortArgs = append(shortArgs, "%"+escapeLikeTerm(term)+"%")
+		}
+		shortSQL += ")"
+		if opts.Type != "" {
+			shortSQL += " AND o.type = ?"
+			shortArgs = append(shortArgs, opts.Type)
+		}
+		if opts.Project != "" {
+			shortSQL += " AND LOWER(o.project) = ?"
+			shortArgs = append(shortArgs, opts.Project)
+		}
+		if opts.Scope != "" {
+			shortSQL += " AND o.scope = ?"
+			shortArgs = append(shortArgs, normalizeScope(opts.Scope))
+		}
+		shortSQL += " ORDER BY o.updated_at DESC LIMIT ?"
+		shortArgs = append(shortArgs, limit)
+
+		shortRows, err := s.queryItHook(s.db, shortSQL, shortArgs...)
+		if err != nil {
+			return nil, fmt.Errorf("search short-term union: %w", err)
+		}
+		for shortRows.Next() {
+			var sr SearchResult
+			if err := shortRows.Scan(
+				&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
+				&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+				&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+				&sr.Rank,
+			); err != nil {
+				return nil, fmt.Errorf("search short-term union scan: %w", err)
+			}
+			if !seen[sr.ID] {
+				results = append(results, sr)
+				seen[sr.ID] = true
+			}
+		}
+		if err := shortRows.Err(); err != nil {
+			return nil, fmt.Errorf("search short-term union rows: %w", err)
+		}
+		if err := shortRows.Close(); err != nil {
+			return nil, err
+		}
 	}
 
 	if len(results) > limit {
@@ -6705,22 +6800,6 @@ func sanitizeFTS(query string) string {
 	return strings.Join(words, " ")
 }
 
-func shouldUseTrigramLikeFallback(query string) bool {
-	terms := searchTerms(query)
-	if len(terms) == 0 {
-		return false
-	}
-	// Only fall back when *every* term is shorter than three runes. A mixed
-	// query like "go to prod" must stay on the FTS/bm25 path so English ranking
-	// and indexing are not degraded by a single short stopword-like token.
-	for _, term := range terms {
-		if utf8.RuneCountInString(term) >= 3 {
-			return false
-		}
-	}
-	return true
-}
-
 func appendLikeSearchCondition(sqlQ *string, args *[]any, expr, query, matchMode string) {
 	terms := searchTerms(query)
 	if len(terms) == 0 {
@@ -6759,6 +6838,55 @@ func escapeLikeTerm(term string) string {
 	term = strings.ReplaceAll(term, `%`, `\%`)
 	term = strings.ReplaceAll(term, `_`, `\_`)
 	return term
+}
+
+// classifyQueryTerms splits a query into long terms (>= 3 Unicode code points,
+// indexable by trigram FTS) and short terms (< 3 code points). Classification
+// is per term so a mixed query like "v2 migration" plans the long term on FTS
+// and enforces the short term separately instead of degrading the whole query.
+func classifyQueryTerms(query string) (longTerms, shortTerms []string) {
+	for _, term := range searchTerms(query) {
+		if utf8.RuneCountInString(term) >= 3 {
+			longTerms = append(longTerms, term)
+		} else {
+			shortTerms = append(shortTerms, term)
+		}
+	}
+	return longTerms, shortTerms
+}
+
+// buildFTSQuery constructs the FTS5 MATCH expression for the indexed (long)
+// terms of a mixed query. "all" ANDs the terms (implicit), "any" ORs them.
+func buildFTSQuery(longTerms []string, matchMode string) string {
+	quoted := make([]string, 0, len(longTerms))
+	for _, term := range longTerms {
+		term = strings.Trim(term, `"`)
+		term = strings.ReplaceAll(term, `"`, `""`)
+		quoted = append(quoted, `"`+term+`"`)
+	}
+	if matchMode == "any" {
+		return strings.Join(quoted, " OR ")
+	}
+	return strings.Join(quoted, " ")
+}
+
+// appendLikePredicate adds LIKE constraints for the short terms of a mixed
+// query onto an existing SQL statement. "all" ANDs the constraints, "any" ORs
+// them so short terms still widen recall.
+func appendLikePredicate(sqlQ *string, args *[]any, expr string, shortTerms []string, matchMode string) {
+	joiner := " AND "
+	if matchMode == "any" {
+		joiner = " OR "
+	}
+	*sqlQ += " AND ("
+	for i, term := range shortTerms {
+		if i > 0 {
+			*sqlQ += joiner
+		}
+		*sqlQ += expr + ` LIKE ? ESCAPE '\'`
+		*args = append(*args, "%"+escapeLikeTerm(term)+"%")
+	}
+	*sqlQ += ")"
 }
 
 // ─── Passive Capture ─────────────────────────────────────────────────────────
