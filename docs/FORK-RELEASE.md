@@ -45,4 +45,4 @@ v1.21.0-zhiyuan.1   # 升级到新上游基线后
 - [ ] `checksums.txt` 存在且与资产匹配
 - [ ] 每个资产 `engram --version` 报告 fork 版本
 - [ ] `/health`、会话创建、观察创建、CJK `/search` 冒烟通过
-- [ ] 标签不可被工作流覆盖（GitHub 不可变标签默认行为）
+- [ ] 仓库 ruleset 已禁止发布标签被删除或强制更新
