@@ -3260,6 +3260,19 @@ func buildFTSCandidateQuery(ftsQuery string, candidateLimit int, shortTerms []st
 	return sqlQ, args
 }
 
+func (s *Store) hasMoreFTSCandidates(ftsQuery string, candidateLimit int) (bool, error) {
+	var hasMore bool
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM observations_fts
+			WHERE observations_fts MATCH ?
+			LIMIT 1 OFFSET ?
+		)
+	`, ftsQuery, candidateLimit).Scan(&hasMore)
+	return hasMore, err
+}
+
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
 	// Validate match_mode early so invalid values always error regardless of query shape.
 	switch opts.MatchMode {
@@ -3413,9 +3426,11 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			}
 			results = results[:0]
 			results = append(results, directResults...)
-			candidateCount := 0
+			seen = make(map[int64]bool, len(directResults)+limit)
+			for _, dr := range directResults {
+				seen[dr.ID] = true
+			}
 			for rows.Next() {
-				candidateCount++
 				var sr SearchResult
 				if err := rows.Scan(
 					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
@@ -3440,7 +3455,14 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 			}
 
 			// 已满足 limit，或候选集未被截断（无更多匹配）则终止
-			if len(results) >= limit || candidateCount < candidateLimit {
+			if len(results) >= limit {
+				break
+			}
+			hasMore, err := s.hasMoreFTSCandidates(ftsQuery, candidateLimit)
+			if err != nil {
+				return nil, fmt.Errorf("check additional search candidates: %w", err)
+			}
+			if !hasMore {
 				break
 			}
 			// 扩大候选集（×4）并重建 SQL

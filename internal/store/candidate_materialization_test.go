@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -98,6 +99,73 @@ func TestCandidateMaterializationProjectIsolation(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("项目 A 记录 #%d 未被召回（候选截断导致项目隔离召回缺失）", aID)
+	}
+}
+
+func TestCandidateExpansionPreservesEarlierFilteredResults(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+
+	if err := s.CreateSession("expand-a", "proj-a", "dir"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateSession("expand-b", "proj-b", "dir"); err != nil {
+		t.Fatal(err)
+	}
+
+	firstID, err := s.AddObservation(AddObservationParams{
+		SessionID: "expand-a", Type: "mem", Title: "candidate expansion marker",
+		Content: "primary", Project: "proj-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 150; i++ {
+		content := fmt.Sprintf("candidate expansion marker competing result %d", i)
+		if _, err := tx.Exec(`
+			INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at)
+			VALUES (?, 'expand-b', 'mem', ?, ?, 'proj-b', 'project', ?, 1, 1, datetime('now'), datetime('now'), datetime('now'))
+		`, fmt.Sprintf("expand-b-%d", i), content, content, hashNormalized(content)); err != nil {
+			tx.Rollback()
+			t.Fatalf("insert competing row %d: %v", i, err)
+		}
+	}
+	lowRankContent := "candidate expansion marker " + strings.Repeat("padding ", 600)
+	result, err := tx.Exec(`
+		INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, normalized_hash, revision_count, duplicate_count, last_seen_at, created_at, updated_at)
+		VALUES ('expand-a-late', 'expand-a', 'mem', 'secondary', ?, 'proj-a', 'project', ?, 1, 1, datetime('now'), datetime('now'), datetime('now'))
+	`, lowRankContent, hashNormalized(lowRankContent))
+	if err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	secondID, err := result.LastInsertId()
+	if err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := s.Search("candidate expansion marker", SearchOptions{Project: "proj-a", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 project results after expansion, got %d", len(results))
+	}
+	seen := map[int64]bool{}
+	for _, result := range results {
+		seen[result.ID] = true
+	}
+	if !seen[firstID] || !seen[secondID] {
+		t.Fatalf("expansion lost a project result: first=%v second=%v", seen[firstID], seen[secondID])
 	}
 }
 
