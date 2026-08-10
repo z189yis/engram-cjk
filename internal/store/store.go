@@ -3216,6 +3216,63 @@ func (s *Store) Timeline(observationID int64, before, after int) (*TimelineResul
 
 // ─── Search (FTS5) ───────────────────────────────────────────────────────────
 
+// buildFTSCandidateQuery 构建 FTS 候选物化查询（性能优化）：
+// 先在 FTS 层按 bm25 物化 top-N 候选（过采样 max(limit×10, 100)），
+// 再 JOIN observations 应用项目/scope/已删除过滤，避免全量 JOIN 开销。
+// 候选集截断发生在精确过滤之前，过滤后结果不足时由调用方自适应扩大。
+// 返回 (sql, args)；candidateLimit 变化时重新调用以重建参数。
+func buildFTSCandidateQuery(ftsQuery string, candidateLimit int, shortTerms []string, matchMode, typeFilter, project, scope string, limit int) (string, []any) {
+	sqlQ := `
+		WITH candidates AS MATERIALIZED (
+			SELECT
+				rowid,
+				bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) AS rank
+			FROM observations_fts
+			WHERE observations_fts MATCH ?
+			ORDER BY rank
+			LIMIT ?
+		)
+		SELECT o.id, ifnull(o.sync_id, '') as sync_id, o.session_id, o.type, o.title, o.content, o.tool_name, o.project,
+		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
+		       c.rank
+		FROM candidates c
+		JOIN observations o ON o.id = c.rowid
+		WHERE o.deleted_at IS NULL
+	`
+	args := []any{ftsQuery, candidateLimit}
+	if len(shortTerms) > 0 && matchMode != "any" {
+		appendLikePredicate(&sqlQ, &args, "o.title || ' ' || ifnull(o.content, '') || ' ' || ifnull(o.tool_name, '') || ' ' || ifnull(o.type, '') || ' ' || ifnull(o.project, '') || ' ' || ifnull(o.topic_key, '')", shortTerms, matchMode)
+	}
+	if typeFilter != "" {
+		sqlQ += " AND o.type = ?"
+		args = append(args, typeFilter)
+	}
+	if project != "" {
+		sqlQ += " AND LOWER(o.project) = ?"
+		args = append(args, project)
+	}
+	if scope != "" {
+		sqlQ += " AND o.scope = ?"
+		args = append(args, normalizeScope(scope))
+	}
+	sqlQ += " ORDER BY c.rank LIMIT ?"
+	args = append(args, limit)
+	return sqlQ, args
+}
+
+func (s *Store) hasMoreFTSCandidates(ftsQuery string, candidateLimit int) (bool, error) {
+	var hasMore bool
+	err := s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1
+			FROM observations_fts
+			WHERE observations_fts MATCH ?
+			LIMIT 1 OFFSET ?
+		)
+	`, ftsQuery, candidateLimit).Scan(&hasMore)
+	return hasMore, err
+}
+
 func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error) {
 	// Validate match_mode early so invalid values always error regardless of query shape.
 	switch opts.MatchMode {
@@ -3291,6 +3348,9 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		       o.scope, o.topic_key, o.revision_count, o.duplicate_count, o.last_seen_at, o.review_after, o.pinned, o.created_at, o.updated_at, o.deleted_at,
 	`
 	var args []any
+	// FTS 候选物化查询状态（在 else 分支中赋值，循环中复用）
+	var ftsQuery string
+	candidateLimit := 0
 	if allShort {
 		sqlQ += `
 		       0.0 as rank
@@ -3298,10 +3358,11 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		WHERE o.deleted_at IS NULL AND `
 		appendLikeSearchCondition(&sqlQ, &args, "ifnull(o.title, '') || ' ' || ifnull(o.content, '') || ' ' || ifnull(o.tool_name, '') || ' ' || ifnull(o.type, '') || ' ' || ifnull(o.project, '') || ' ' || ifnull(o.topic_key, '')", query, opts.MatchMode)
 	} else {
-		// FTS path. In mixed queries only the long terms go into MATCH; short
-		// terms are added as LIKE predicates below so they still constrain the
-		// result (trigram FTS treats < 3-code-point terms as unconstrained).
-		var ftsQuery string
+		// FTS path with candidate materialization (性能优化：避免全量 JOIN)。
+		// external-content FTS 的 JOIN 需逐行回读 observations 表，词频越高
+		// 命中越多，JOIN 开销线性增长。先在 FTS 层按 bm25 物化 top-N 候选
+		// （过采样 max(limit×10, 100)），再 JOIN 应用项目/scope/已删除过滤；
+		// 若过滤后结果不足则自适应扩大候选集。
 		if len(shortTerms) > 0 {
 			ftsQuery = buildFTSQuery(longTerms, opts.MatchMode)
 		} else if opts.MatchMode == "any" {
@@ -3309,73 +3370,105 @@ func (s *Store) Search(query string, opts SearchOptions) ([]SearchResult, error)
 		} else {
 			ftsQuery = sanitizeFTS(query)
 		}
-		sqlQ += `
-		       bm25(observations_fts, 5.0, 1.0, 0.0, 0.0, 0.0, 3.0) as rank
-		FROM observations_fts fts
-		JOIN observations o ON o.id = fts.rowid
-		WHERE observations_fts MATCH ? AND o.deleted_at IS NULL
-	`
-		args = append(args, ftsQuery)
-		if len(shortTerms) > 0 && opts.MatchMode != "any" {
-			appendLikePredicate(&sqlQ, &args, "o.title || ' ' || ifnull(o.content, '') || ' ' || ifnull(o.tool_name, '') || ' ' || ifnull(o.type, '') || ' ' || ifnull(o.project, '') || ' ' || ifnull(o.topic_key, '')", shortTerms, opts.MatchMode)
+
+		// 过采样候选：max(limit×10, 100)，防止项目/scope/deleted 过滤后
+		// 结果不足导致召回缺失。若首轮过滤后结果不足，自适应扩大候选集。
+		candidateLimit = limit * 10
+		if candidateLimit < 100 {
+			candidateLimit = 100
 		}
+		sqlQ, args = buildFTSCandidateQuery(ftsQuery, candidateLimit, shortTerms, opts.MatchMode, opts.Type, opts.Project, opts.Scope, limit)
 	}
 
-	if opts.Type != "" {
-		sqlQ += " AND o.type = ?"
-		args = append(args, opts.Type)
-	}
-
-	if opts.Project != "" {
-		sqlQ += " AND LOWER(o.project) = ?"
-		args = append(args, opts.Project)
-	}
-
-	if opts.Scope != "" {
-		sqlQ += " AND o.scope = ?"
-		args = append(args, normalizeScope(opts.Scope))
-	}
-
-	if allShort {
-		sqlQ += " ORDER BY o.updated_at DESC LIMIT ?"
-	} else {
-		sqlQ += " ORDER BY rank LIMIT ?"
-	}
-	args = append(args, limit)
-
-	rows, err := s.queryItHook(s.db, sqlQ, args...)
-	if err != nil {
-		return nil, fmt.Errorf("search: %w", err)
-	}
-	defer rows.Close()
-
+	// 自适应扩大候选集：若项目/scope/已删除过滤后结果不足 limit 且
+	// 候选集可能被截断（候选数 == candidateLimit），扩大候选范围重试。
+	// 最多 4 轮（初始过采样 + 3 次扩大 ×4），避免无限循环。
+	maxRounds := 4
 	seen := make(map[int64]bool)
 	for _, dr := range directResults {
 		seen[dr.ID] = true
 	}
-
 	var results []SearchResult
-	results = append(results, directResults...)
-	for rows.Next() {
-		var sr SearchResult
-		if err := rows.Scan(
-			&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
-			&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
-			&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
-			&sr.Rank,
-		); err != nil {
+	if allShort {
+		rows, err := s.queryItHook(s.db, sqlQ, args...)
+		if err != nil {
+			return nil, fmt.Errorf("search: %w", err)
+		}
+		results = append(results, directResults...)
+		for rows.Next() {
+			var sr SearchResult
+			if err := rows.Scan(
+				&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
+				&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+				&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+				&sr.Rank,
+			); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !seen[sr.ID] {
+				results = append(results, sr)
+				seen[sr.ID] = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		if !seen[sr.ID] {
-			results = append(results, sr)
-			seen[sr.ID] = true
+		if err := rows.Close(); err != nil {
+			return nil, err
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
+	} else {
+		for round := 0; round < maxRounds; round++ {
+			rows, err := s.queryItHook(s.db, sqlQ, args...)
+			if err != nil {
+				return nil, fmt.Errorf("search: %w", err)
+			}
+			results = results[:0]
+			results = append(results, directResults...)
+			seen = make(map[int64]bool, len(directResults)+limit)
+			for _, dr := range directResults {
+				seen[dr.ID] = true
+			}
+			for rows.Next() {
+				var sr SearchResult
+				if err := rows.Scan(
+					&sr.ID, &sr.SyncID, &sr.SessionID, &sr.Type, &sr.Title, &sr.Content,
+					&sr.ToolName, &sr.Project, &sr.Scope, &sr.TopicKey, &sr.RevisionCount, &sr.DuplicateCount,
+					&sr.LastSeenAt, &sr.ReviewAfter, &sr.Pinned, &sr.CreatedAt, &sr.UpdatedAt, &sr.DeletedAt,
+					&sr.Rank,
+				); err != nil {
+					rows.Close()
+					return nil, err
+				}
+				if !seen[sr.ID] {
+					results = append(results, sr)
+					seen[sr.ID] = true
+				}
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if err := rows.Close(); err != nil {
+				return nil, err
+			}
+
+			// 已满足 limit，或候选集未被截断（无更多匹配）则终止
+			if len(results) >= limit {
+				break
+			}
+			hasMore, err := s.hasMoreFTSCandidates(ftsQuery, candidateLimit)
+			if err != nil {
+				return nil, fmt.Errorf("check additional search candidates: %w", err)
+			}
+			if !hasMore {
+				break
+			}
+			// 扩大候选集（×4）并重建 SQL
+			candidateLimit *= 4
+			sqlQ, args = buildFTSCandidateQuery(ftsQuery, candidateLimit, shortTerms, opts.MatchMode, opts.Type, opts.Project, opts.Scope, limit)
+		}
 	}
 
 	// any 混合模式：短词命中的行尚未被 FTS 结果覆盖时补充并入。
