@@ -115,3 +115,30 @@ func TestTriggersRecreateIdempotentWithWhenClause(t *testing.T) {
 		t.Errorf("重建触发器后搜索应命中 1 条，got %d", len(results))
 	}
 }
+
+func TestTriggersHardDeleteNeverIndexedSoftDeletedRow(t *testing.T) {
+	s := newTestStore(t)
+	defer s.Close()
+
+	if err := s.CreateSession("t3", "proj", "dir"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.execHook(s.db, `
+		INSERT INTO observations (sync_id, session_id, type, title, content, project, scope, deleted_at)
+		VALUES ('obs-dead-hard-delete', 't3', 'mem', 'deleted before indexing', 'content', 'proj', 'project', datetime('now'))
+	`)
+	if err != nil {
+		t.Fatalf("insert deleted row: %v", err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("read inserted id: %v", err)
+	}
+
+	if _, err := s.execHook(s.db, `DELETE FROM observations WHERE id = ?`, id); err != nil {
+		t.Fatalf("hard delete never-indexed row: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO observations_fts(observations_fts) VALUES ('integrity-check')`); err != nil {
+		t.Fatalf("fts integrity check after hard delete: %v", err)
+	}
+}

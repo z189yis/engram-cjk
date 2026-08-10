@@ -2024,7 +2024,8 @@ func (s *Store) recreateObservationFTSTriggers() error {
 
 		CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
 			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+			SELECT 'delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key
+			WHERE old.deleted_at IS NULL;
 		END;
 
 		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
