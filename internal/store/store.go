@@ -2005,27 +2005,36 @@ func (s *Store) ensurePromptsFTSTrigram() error {
 }
 
 func (s *Store) recreateObservationFTSTriggers() error {
-	// Keep trigger shape aligned with main's delete/insert FTS sync. Soft-delete
-	// gating (WHERE new.deleted_at IS NULL) belongs in a separate PR.
+	// 软删除门控（单一 update 触发器，语句顺序保证 delete 先于 insert）：
+	// - insert 触发器带 WHEN：直接以 deleted_at 非空插入的行不入索引
+	// - update 触发器：先删除旧索引行（WHERE 保护，避免对从未索引的行
+	//   执行 delete 损坏 external-content 索引），再按需插入新行——
+	//   软删除（new.deleted_at 非空）不重插，恢复自动重新索引
+	// - delete 触发器：硬删除时清理索引行
 	if _, err := s.execHook(s.db, `
 		DROP TRIGGER IF EXISTS obs_fts_insert;
 		DROP TRIGGER IF EXISTS obs_fts_update;
 		DROP TRIGGER IF EXISTS obs_fts_delete;
-		CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations BEGIN
+		CREATE TRIGGER obs_fts_insert AFTER INSERT ON observations
+		WHEN new.deleted_at IS NULL
+		BEGIN
 			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
 			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
 		END;
 
 		CREATE TRIGGER obs_fts_delete AFTER DELETE ON observations BEGIN
 			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+			SELECT 'delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key
+			WHERE old.deleted_at IS NULL;
 		END;
 
 		CREATE TRIGGER obs_fts_update AFTER UPDATE ON observations BEGIN
 			INSERT INTO observations_fts(observations_fts, rowid, title, content, tool_name, type, project, topic_key)
-			VALUES ('delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key);
+			SELECT 'delete', old.id, old.title, old.content, old.tool_name, old.type, old.project, old.topic_key
+			WHERE old.deleted_at IS NULL;
 			INSERT INTO observations_fts(rowid, title, content, tool_name, type, project, topic_key)
-			VALUES (new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key);
+			SELECT new.id, new.title, new.content, new.tool_name, new.type, new.project, new.topic_key
+			WHERE new.deleted_at IS NULL;
 		END;
 	`); err != nil {
 		return fmt.Errorf("recreate observations fts triggers: %w", err)
