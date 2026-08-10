@@ -1,0 +1,61 @@
+# ZhiYuan fork 发布配置（方案 §7 Phase 5）
+# - 6 平台二进制（mac/win/linux × amd64/arm64）
+# - 不含 Homebrew tap（fork 不发布到上游 tap）
+# - 生成 SBOM（cyclonedx）
+# - 版本通过标签注入（v1.20.0-zhiyuan.1 格式）
+
+version: 2
+
+project_name: engram
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/engram
+    binary: engram
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    hooks:
+      post:
+        - cmd: sh -c 'if [ "{{ .Os }}" = "darwin" ] && command -v codesign >/dev/null 2>&1; then codesign --force --sign - "{{ .Path }}"; fi'
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+
+sboms:
+  - artifacts: archive
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+release:
+  disable: false
+  footer: |
+    ---
+    🤖 Generated with [Claude Code](https://claude.com/claude-code)
+    Fork 发布由 [.goreleaser.fork.yaml](.goreleaser.fork.yaml) 生成。

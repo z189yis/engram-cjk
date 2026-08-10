@@ -1,0 +1,57 @@
+name: Fork Release
+
+# ZhiYuan fork 发布工作流（方案 §7 Phase 5）
+# - 触发：推送 v*-zhiyuan.* 标签
+# - 产物：6 平台二进制 + checksum + SBOM
+# - 与上游 release.yml 分离，避免 Homebrew tap 误发布
+
+on:
+  push:
+    tags:
+      - "v*-zhiyuan.*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+
+      - name: Run GoReleaser (fork config)
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --clean -f .goreleaser.fork.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify asset manifest
+        run: |
+          echo "=== 发布资产 ==="
+          ls -la dist/
+          echo "=== 校验和 ==="
+          cat dist/checksums.txt
+          echo "=== 必需资产检查 ==="
+          for asset in \
+            "engram_${GITHUB_REF_NAME}_darwin_amd64.tar.gz" \
+            "engram_${GITHUB_REF_NAME}_darwin_arm64.tar.gz" \
+            "engram_${GITHUB_REF_NAME}_windows_amd64.zip" \
+            "engram_${GITHUB_REF_NAME}_windows_arm64.zip" \
+            "engram_${GITHUB_REF_NAME}_linux_amd64.tar.gz" \
+            "engram_${GITHUB_REF_NAME}_linux_arm64.tar.gz"; do
+            if [ ! -f "dist/$asset" ]; then
+              echo "❌ 缺少必需资产: $asset"
+              exit 1
+            fi
+            echo "✅ $asset"
+          done
