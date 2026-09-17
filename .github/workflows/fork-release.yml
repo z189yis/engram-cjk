@@ -14,8 +14,10 @@ permissions:
   contents: write
 
 jobs:
-  goreleaser:
+  verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -35,6 +37,33 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      - name: Verify release source is on main
+        run: |
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  goreleaser:
+    needs: verify
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.10"
+      - name: Connect Certum SimplySign
+        id: certum
+        uses: ./.github/actions/setup-certum-signing
+        with:
+          user-id: ${{ secrets.CERTUM_USER_ID }}
+          otp-uri: ${{ secrets.CERTUM_OTP_URI }}
+          certificate-thumbprint: ${{ secrets.CERTUM_CERT_THUMBPRINT }}
       - name: Install Syft
         uses: anchore/sbom-action/download-syft@v0
 
@@ -45,6 +74,7 @@ jobs:
           args: release --clean -f .goreleaser.fork.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CERTUM_CERT_THUMBPRINT: ${{ steps.certum.outputs.thumbprint }}
 
       - name: Verify asset manifest
         run: |

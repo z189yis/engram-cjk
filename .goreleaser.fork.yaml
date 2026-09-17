@@ -24,6 +24,9 @@ builds:
       - -s -w -X main.version={{.Version}}
     hooks:
       post:
+        - cmd: >-
+            pwsh -NoProfile -File tools/windows-signing/sign-runtime.ps1
+            -Path "{{ .Path }}" -TargetOS "{{ .Os }}"
         - cmd: sh -c 'if [ "{{ .Os }}" = "darwin" ] && command -v codesign >/dev/null 2>&1; then codesign --force --sign - "{{ .Path }}"; fi'
 
 archives:
