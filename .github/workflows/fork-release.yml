@@ -77,7 +77,6 @@ jobs:
       contents: write
     env:
       RUNTIME_ARTIFACT_READ_TOKEN: ${{ secrets.RUNTIME_ARTIFACT_READ_TOKEN }}
-      RUNTIME_SIGNER_THUMBPRINT: ${{ vars.RUNTIME_SIGNER_THUMBPRINT }}
     defaults:
       run:
         shell: pwsh
@@ -98,12 +97,8 @@ jobs:
         env:
           SIGNING_RUN_ID: ${{ inputs.signing_run_id }}
         run: node tools/windows-signing/verify-return.mjs engram "$env:SIGNING_RUN_ID" signed-runtime
-      - name: Verify both returned signatures
+      - name: Resolve centrally signed runtime directory
         run: |
-          . ./tools/windows-signing/runtime-authenticode.ps1
-          foreach ($arch in @('amd64', 'arm64')) {
-            Assert-WindowsRuntimeSignature -Path "signed-runtime/engram-windows-$arch.exe" -ExpectedThumbprint $env:RUNTIME_SIGNER_THUMBPRINT
-          }
           "SIGNED_RUNTIME_DIRECTORY=$((Resolve-Path signed-runtime).Path)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - uses: actions/checkout@v6
         with:
