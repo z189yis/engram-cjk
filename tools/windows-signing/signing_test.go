@@ -2,8 +2,6 @@ package signing_test
 
 import (
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -20,7 +18,7 @@ func TestForkReleaseSignsWindowsBeforeArchiving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"windows-latest", "environment: release", "repository: rongxinzy/RongxinAI", "verify-return.mjs", "Assert-WindowsRuntimeSignature", "--skip=publish,announce", "GORELEASER_CURRENT_TAG:", "publish-engram.mjs"} {
+	for _, required := range []string{"windows-latest", "environment: release", "repository: rongxinzy/RongxinAI", "verify-return.mjs", "--skip=publish,announce", "GORELEASER_CURRENT_TAG:", "publish-engram.mjs"} {
 		if !strings.Contains(string(workflow), required) {
 			t.Fatalf("Missing release boundary: %s", required)
 		}
@@ -36,15 +34,9 @@ func TestForkReleaseSignsWindowsBeforeArchiving(t *testing.T) {
 	if strings.Index(text, "cmp ") > strings.Index(text, "run: node tools/windows-signing/publish-engram.mjs") {
 		t.Fatal("Archive validation must precede release publication")
 	}
-}
-
-func TestAuthenticodePolicy(t *testing.T) {
-	if runtime.GOOS != "windows" {
-		t.Skip("PowerShell Authenticode policy tests run on Windows CI")
+	for _, removed := range []string{"Assert-WindowsRuntimeSignature", "RUNTIME_SIGNER_THUMBPRINT", "runtime-authenticode.ps1"} {
+		if strings.Contains(text, removed) {
+			t.Fatalf("Runtime publication must not require signature verification: %s", removed)
+		}
 	}
-	output, err := exec.Command("powershell.exe", "-NoProfile", "-File", "runtime-authenticode.test.ps1").CombinedOutput()
-	if err != nil {
-		t.Fatalf("%v\n%s", err, output)
-	}
-	t.Log(string(output))
 }
