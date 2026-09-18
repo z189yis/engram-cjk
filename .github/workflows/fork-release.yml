@@ -1,98 +1,125 @@
 name: Fork Release
-
-# ZhiYuan fork 发布工作流（方案 §7 Phase 5）
-# - 触发：推送 v*-zhiyuan.* 标签
-# - 产物：6 平台二进制 + checksum + SBOM
-# - 与上游 release.yml 分离，避免 Homebrew tap 误发布
-
 on:
   push:
-    tags:
-      - "v*-zhiyuan.*"
-
+    tags: ['v*-zhiyuan.*']
+  workflow_dispatch:
+    inputs:
+      signing_run_id:
+        description: Successful RongxinAI central signing run ID
+        type: string
+        required: true
 permissions:
-  contents: write
-
+  contents: read
+concurrency:
+  group: engram-fork-release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  verify:
+  build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: "1.25.10"
-
-      - name: Verify dependencies are tidy
-        run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-
-      - name: Run tests
-        run: go test ./...
-
-      - name: Verify release source is on main
-        run: |
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-
-  goreleaser:
-    needs: verify
-    runs-on: windows-latest
-    environment: release
-    timeout-minutes: 45
-    defaults:
-      run:
-        shell: bash
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       - uses: actions/setup-go@v6
         with:
-          go-version: "1.25.10"
-      - name: Connect Certum SimplySign
-        id: certum
-        uses: ./.github/actions/setup-certum-signing
+          go-version: '1.25.10'
+      - uses: actions/setup-node@v6
         with:
-          user-id: ${{ secrets.CERTUM_USER_ID }}
-          otp-uri: ${{ secrets.CERTUM_OTP_URI }}
-          certificate-thumbprint: ${{ secrets.CERTUM_CERT_THUMBPRINT }}
-      - name: Install Syft
-        uses: anchore/sbom-action/download-syft@v0
-
-      - name: Run GoReleaser (fork config)
+          node-version: '24.x'
+      - name: Verify source and dependencies
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go test ./...
+      - name: Build only, with no release or credentials
         uses: goreleaser/goreleaser-action@v7
         with:
-          version: "~> v2"
-          args: release --clean -f .goreleaser.fork.yaml
+          version: 'v2.18.2'
+          args: build --clean -f .goreleaser.fork.yaml
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CERTUM_CERT_THUMBPRINT: ${{ steps.certum.outputs.thumbprint }}
-
-      - name: Verify asset manifest
+          RUNTIME_UNSIGNED_BUILD: '1'
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+      - run: node tools/windows-signing/collect-engram.mjs
+      - uses: actions/upload-artifact@v6
+        with:
+          name: unsigned-engram-binaries
+          path: unsigned-runtime/*.exe
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      RUNTIME_ARTIFACT_READ_TOKEN: ${{ secrets.RUNTIME_ARTIFACT_READ_TOKEN }}
+      RUNTIME_SIGNER_THUMBPRINT: ${{ vars.RUNTIME_SIGNER_THUMBPRINT }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24.x'
+      - uses: actions/download-artifact@v8
+        with:
+          repository: rongxinzy/RongxinAI
+          run-id: ${{ inputs.signing_run_id }}
+          name: signed-engram
+          path: signed-runtime
+          github-token: ${{ secrets.RUNTIME_ARTIFACT_READ_TOKEN }}
+      - name: Verify central signing and source provenance
+        id: source
+        env:
+          SIGNING_RUN_ID: ${{ inputs.signing_run_id }}
+        run: node tools/windows-signing/verify-return.mjs engram "$env:SIGNING_RUN_ID" signed-runtime
+      - name: Verify both returned signatures
         run: |
-          echo "=== 发布资产 ==="
-          ls -la dist/
-          echo "=== 校验和 ==="
-          cat dist/checksums.txt
-          echo "=== 必需资产检查 ==="
-          for asset in \
-            "engram_${GITHUB_REF_NAME}_darwin_amd64.tar.gz" \
-            "engram_${GITHUB_REF_NAME}_darwin_arm64.tar.gz" \
-            "engram_${GITHUB_REF_NAME}_windows_amd64.zip" \
-            "engram_${GITHUB_REF_NAME}_windows_arm64.zip" \
-            "engram_${GITHUB_REF_NAME}_linux_amd64.tar.gz" \
-            "engram_${GITHUB_REF_NAME}_linux_arm64.tar.gz"; do
-            if [ ! -f "dist/$asset" ]; then
-              echo "❌ 缺少必需资产: $asset"
-              exit 1
-            fi
-            echo "✅ $asset"
+          . ./tools/windows-signing/runtime-authenticode.ps1
+          foreach ($arch in @('amd64', 'arm64')) {
+            Assert-WindowsRuntimeSignature -Path "signed-runtime/engram-windows-$arch.exe" -ExpectedThumbprint $env:RUNTIME_SIGNER_THUMBPRINT
+          }
+          "SIGNED_RUNTIME_DIRECTORY=$((Resolve-Path signed-runtime).Path)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          fetch-depth: 0
+          path: source
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.10'
+      - uses: anchore/sbom-action/download-syft@v0
+      - name: Archive authenticated signed bytes without publishing
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: 'v2.18.2'
+          workdir: source
+          args: release --clean --skip=publish,announce -f .goreleaser.fork.yaml
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GORELEASER_CURRENT_TAG: ${{ steps.source.outputs.tag }}
+      - name: Check final Windows archives contain the signed bytes
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            unzip -p "source/dist/engram_${SOURCE_TAG}_windows_${arch}.zip" engram.exe > "engram-${arch}.exe"
+            cmp "engram-${arch}.exe" "signed-runtime/engram-windows-${arch}.exe"
           done
+          cd source/dist
+          sha256sum --check checksums.txt
+      - name: Publish verified archives, checksums and SBOMs in the original repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ steps.source.outputs.tag }}
+        run: node tools/windows-signing/publish-engram.mjs source/dist "$env:SOURCE_TAG"

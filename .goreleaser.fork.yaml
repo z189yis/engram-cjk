@@ -11,6 +11,9 @@ project_name: engram
 builds:
   - main: ./cmd/engram
     binary: engram
+    flags:
+      - -trimpath
+      - -buildvcs=false
     env:
       - CGO_ENABLED=0
     goos:
@@ -25,8 +28,8 @@ builds:
     hooks:
       post:
         - cmd: >-
-            pwsh -NoProfile -File tools/windows-signing/sign-runtime.ps1
-            -Path "{{ .Path }}" -TargetOS "{{ .Os }}"
+            node tools/windows-signing/replace-signed-runtime.mjs
+            "{{ .Path }}" "{{ .Os }}" "{{ .Arch }}"
         - cmd: sh -c 'if [ "{{ .Os }}" = "darwin" ] && command -v codesign >/dev/null 2>&1; then codesign --force --sign - "{{ .Path }}"; fi'
 
 archives:

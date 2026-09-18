@@ -13,17 +13,24 @@ func TestForkReleaseSignsWindowsBeforeArchiving(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(config), "tools/windows-signing/sign-runtime.ps1") {
-		t.Fatal("Windows release must sign executable bytes in a build post-hook before archives, checksums, and SBOMs")
+	if !strings.Contains(string(config), "tools/windows-signing/replace-signed-runtime.mjs") {
+		t.Fatal("Windows release must substitute verified signed bytes before archives, checksums, and SBOMs")
 	}
 	workflow, err := os.ReadFile("../../.github/workflows/fork-release.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, required := range []string{"windows-latest", "environment: release", "setup-certum-signing", "CERTUM_CERT_THUMBPRINT:", "needs: verify"} {
+	for _, required := range []string{"windows-latest", "environment: release", "repository: rongxinzy/RongxinAI", "verify-return.mjs", "Assert-WindowsRuntimeSignature", "--skip=publish,announce", "GORELEASER_CURRENT_TAG:", "publish-engram.mjs"} {
 		if !strings.Contains(string(workflow), required) {
 			t.Fatalf("Missing release boundary: %s", required)
 		}
+	}
+	text := string(workflow)
+	if strings.Contains(text, "CERTUM_") || strings.Contains(text, "setup-certum-signing") {
+		t.Fatal("Signing credentials must remain exclusively in RongxinAI")
+	}
+	if strings.Index(text, "cmp ") > strings.Index(text, "run: node tools/windows-signing/publish-engram.mjs") {
+		t.Fatal("Archive validation must precede release publication")
 	}
 }
 
