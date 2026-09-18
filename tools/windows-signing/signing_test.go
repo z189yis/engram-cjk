@@ -26,6 +26,10 @@ func TestForkReleaseSignsWindowsBeforeArchiving(t *testing.T) {
 		}
 	}
 	text := string(workflow)
+	build := text[strings.Index(text, "  build:"):strings.Index(text, "  publish:")]
+	if !strings.Contains(build, "needs: verify") || !strings.Contains(build, "runs-on: windows-latest") {
+		t.Fatal("Unsigned and publication rebuilds must use the same host platform after Linux source verification")
+	}
 	if strings.Contains(text, "CERTUM_") || strings.Contains(text, "setup-certum-signing") {
 		t.Fatal("Signing credentials must remain exclusively in RongxinAI")
 	}
